@@ -1,0 +1,713 @@
+\documentclass{article}
+\usepackage{graphicx}
+\usepackage{graphicx, subfig}
+\usepackage[a4paper, total={6in, 8in}, margin = 0.8in]{geometry}
+\usepackage{hyperref}
+\usepackage{float}
+
+\title{Genomics 2 Assignment 2}
+\author{404018}
+\date{March 2021}
+
+\begin{document}
+\maketitle
+
+<<Setup, echo = F, results = F>>=
+library('DNAcopy')
+library(gridExtra)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+library(dplyr, warn.conflicts = FALSE, quietly = T)
+@
+
+\section{Making the Data}
+First I generated the data. I followed the procedure suggested for each chromosome individually. I read in the chromosome lengths and set the probability distribution and expected lengths of copy number changes.
+
+<<Set_initialisation, tidy = T, echo = F>>=
+#Read in chromosome lengths
+positions <- read.csv('~/G2/Chromosome_positions.csv', header = F)
+
+#Set priors
+prob_lossgain <- c(0.12, 0.75, 0.13)
+mean_length <- c(4e4, 1e6, 2.5e4)
+@
+
+Next I worked through the chromosome, setting the copy number state sampling from the given distribution, the length using the expected lengths L and a poisson distribution, then moving to the next region successively over the length of the chromosome.
+
+<<Generate_data, tidy = T, echo = F>>=
+simulate_cnv <- function(chromosome_num, prob_lossgain, mean_length) {
+  #Function to get copy number state for each chromosome
+  
+  #Set up some starting conditions, initiate memory
+  i <- 1; j <- 1
+  position_start <- c()
+  position_end <- c()
+  copy_number <- c()
+  length_chromosome <- positions$V2[chromosome_num]
+  
+  #Set probe positions
+  num_probes <- round(3e4/ chromosome_num)
+  probe_positions <- round(seq(1, length_chromosome, length.out = num_probes))
+  
+  #Work through the whole chromosome
+  while (i <= length_chromosome) {
+    
+    #Get probability for copy change
+    cnv <- sample(1:3, 1, prob = prob_lossgain)
+    
+    #Get length to apply this to
+    cnv_length <- rpois(1, mean_length[cnv])
+    
+    #Apply the CNV to the bases affected or to end (whichever is sooner)
+    #Add some term where it skips to the start of the next chromosome
+    if (i + cnv_length - 1 <= length_chromosome) {
+      copy_number[j] <- cnv
+      position_start[j] <- i
+      position_end[j] <- i + cnv_length -1
+    } else {
+      copy_number[j] <- cnv
+      position_start[j] <- i
+      position_end[j] <- length_chromosome
+    }
+    
+    #Move to next position
+    i <- i + cnv_length
+    j <- j + 1
+  }
+  
+  #Now allocate these to the probe positions
+  probes <- rep(NA, length(probe_positions))
+  
+  for (i in 1:length(probes)) {
+    #Get probes for each section
+    loc <- which(probe_positions >= position_start[i] & probe_positions <= position_end[i])
+    
+    #Assign to parent frame
+    probes[loc] <- copy_number[i]
+  }
+
+  return(probes)
+}
+@
+
+I then used this function for all chromosomes to make an object containing all of the copy number changes, which I plotted across the whole genome (fig \ref{fig:plot_all_cn}). I then added the noise according to the procedure suggested.
+
+<<Make_copy_number, echo = F, tidy = T, cache = T>>=
+#Make copy number state for all chromosomes
+all_chr_cnv <- unlist(lapply(1:22, simulate_cnv, prob_lossgain, mean_length))
+
+#Do log and normal error
+log_all_cnv <- log2(all_chr_cnv/2)
+
+#Add the errors 0.05, 0.1, 0.25, 0.2, 0.5
+Ys <- list()
+errors <- c(0.05, 0.1, 0.2, 0.25, 0.5) 
+for (i in 1:5) {
+  Ys[[i]] <- log_all_cnv + rnorm(length(log_all_cnv), mean = 0, sd = errors[i])
+}
+@
+
+\begin{figure}[H]
+\centering
+<<Plot_cn, echo = F, tidy = T, fig = T,  fig.width= 10, fig.height=4>>=
+#Plot
+ggplot() + geom_point(aes(x = 1:length(all_chr_cnv), y = all_chr_cnv, col = as.factor(all_chr_cnv), alpha = 0.5)) + 
+  xlab('Probe number') + ylab('Copy number') + 
+  theme_minimal() + theme(legend.position = 'none')
+@
+\caption{Figure showing all simulated copy numbers against probe number across the whole genome}
+\label{fig:plot_all_cn}
+\end{figure}
+
+Next I ran DNAcopy on the data. I wrapped the functions from DNAcopy into a single function for use.
+
+<<DNA_copy, tidy = T, echo = F, results = F, message = F, cache = T>>=
+#Make probe position and chromosome vectors for DNAcopy
+probe_chr <- unlist(sapply(1:22, function(x) {rep(x, times = round(3e4/ x))}))
+probe_positions <- unlist(sapply(1:22, function(x) {round(seq(1, positions$V2[x], length.out = round(3e4/ x)))}))
+
+make_cna <- function(i, input, errors) {
+  #Function to wrapy copy_number bits
+  label <- paste0('error_of_', errors[i])
+  input <- input[[i]]
+  
+  #Make CNA object
+  CNA.object <- CNA(cbind(input),
+                    probe_chr,probe_positions,
+                    data.type="logratio",sampleid=label)
+  
+  #Label CNA object
+  smoothed.CNA.object <- smooth.CNA(CNA.object)
+  
+  #Segment it
+  return(list(CNA.object, segment(smoothed.CNA.object, verbose=1)))
+}
+
+segmented.objects <- lapply(1:5, make_cna, Ys, errors)
+@
+
+I then plotted the segmented copy numbers (fig \ref{fig:segmented_means})
+
+\begin{figure}[H]
+\centering
+<<Plot_segmented_means, echo = F, fig = T>>=
+par(mfrow = c(3, 2))
+plot(segmented.objects[[1]][[2]], plot.type="w")
+title(sub = 'Noise of 0.05 SD')
+plot(segmented.objects[[2]][[2]], plot.type="w")
+title(sub = 'Noise of 0.1 SD')
+plot(segmented.objects[[3]][[2]], plot.type="w")
+title(sub = 'Noise of 0.2 SD')
+plot(segmented.objects[[4]][[2]], plot.type="w")
+title(sub = 'Noise of 0.25 SD')
+plot(segmented.objects[[5]][[2]], plot.type="w")
+title(sub = 'Noise of 0.5 SD')
+@
+\caption{Figure showing segmented mean copy number (log2(R/2)) on the Y axis and genomic position on X axis for different levels of noise}
+\label{fig:segmented_means}
+\end{figure}
+
+\newpage
+\section{Assess how well these profiles represent the theoretical data}
+I used mean squared error (MSE) to compare the profiles with noise following copy number segmentation against the original simulated copy number state. 
+
+<<Compare profiles, echo = F>>=
+mse1 <- sum(abs(rep(segmented.objects[[1]][[2]]$output$seg.mean, segmented.objects[[1]][[2]]$output$num.mark) - 
+          log2(all_chr_cnv/2))^2)/length(all_chr_cnv)
+mse2 <- sum(abs(rep(segmented.objects[[2]][[2]]$output$seg.mean, segmented.objects[[2]][[2]]$output$num.mark) - 
+          log2(all_chr_cnv/2))^2)/length(all_chr_cnv)
+mse3 <- sum(abs(rep(segmented.objects[[3]][[2]]$output$seg.mean, segmented.objects[[3]][[2]]$output$num.mark) - 
+          log2(all_chr_cnv/2))^2)/length(all_chr_cnv)
+mse4 <- sum(abs(rep(segmented.objects[[4]][[2]]$output$seg.mean, segmented.objects[[4]][[2]]$output$num.mark) - 
+          log2(all_chr_cnv/2))^2)/length(all_chr_cnv)
+mse5 <- sum(abs(rep(segmented.objects[[5]][[2]]$output$seg.mean, segmented.objects[[5]][[2]]$output$num.mark) - 
+          log2(all_chr_cnv/2))^2)/length(all_chr_cnv)
+
+@
+
+I found that the difference between the predicted and the actual copy number for all of the probes increased as the noise increase in a linear fashion. 
+
+\begin{figure}[H]
+\centering
+<<Plot_MSE, fig = T, echo = F, fig.height = 5, fig.width = 10>>=
+mses <- c(mse1, mse2, mse3, mse4, mse5)
+ggplot() + geom_line(aes(x = errors, y = mses)) + 
+  geom_point(aes(x = errors, y = mses)) + 
+  geom_smooth(aes(x = errors, y = mses), method = lm, formula = y ~ x) + 
+  theme_minimal() + 
+  xlab('Standard deviation of gaussian noise introduced') + 
+  ylab('Mean squared error of predicted copy number')
+
+cnv_lm <- summary(lm(errors ~ mses))
+@
+\caption{Plot comparing the amount of noise introduced to the mean squared error of the predicted copy number given by DNAcopy against the original simulated copy number}
+\label{fig:plot_mse}
+\end{figure}
+
+I then fitted a linear model to compare the mean square errors against the amount of noise introduced. I found this to be linearly associated to the standard deviation of the gaussian noise introduced with p = \Sexpr{signif(cnv_lm$coefficients[2,4], digit = 3)} for the linear model.
+
+\newpage
+\section{Copy number calls}
+I calculated the accuracy ($TP + TN/ TOTAL$) of the predicted segmented means against the true copy number at different threshold cutoffs ($t_G$ and $t_L$) to objectively consider how DNAcopy performed at different thresholds (fig \ref{fig:plot_acc}). You can see here that the overall accuracy is very high because the majority of probes have no copy number change and are therefore correctly assigned to have no copy number change. However there is some change in the accuracy as the cutoff is increased - there is a peak and then a drop. These plots confirm that the cutoff range with the highest accuracy corresponds to the largest gap between segmented means in the plateau plots (fig \ref{fig:plateau_plots}). 
+
+For example in the plateau plot with noise of 0.2 SD you can see that the peak of accuracy corresponds to the largest gap between segmented means in the gain of copy section. In this scenario the gap is slightly less clear than in the other plots so this makes it clear that the optimum value to set the threshold will be in the largest gap. This provides good validation for the use of the plateau plots as a tool for setting the cutoffs. However a limitation of plateau plots is that the have to be viewed for every sample for the cutoffs to be set.
+
+<<Check_predictions, echo = F, tidy = T>>=
+check_model_performance <- function(i, input, cutoffs, ground_truth, accuracy = F) {
+  #Function to check model performance
+  
+  input <- input[[i]][[2]]$output
+  if (accuracy == F) {
+    cutoff <- cutoffs[i]
+    } else {cutoff <- cutoffs}
+  
+  #Make predictions given each of the p plots above
+  predicted_probes <- rep(input$seg.mean, input$num.mark)
+  gained_probes <- which(predicted_probes > cutoff)
+  lost_probes <- which(predicted_probes < -cutoff)
+
+  #Reconstruct the original using these predictions
+  new_predictions <- rep(2, times = length(ground_truth))
+  new_predictions[gained_probes] <- 3
+  new_predictions[lost_probes] <- 1
+
+  #Count how many probes are wrongly allocated
+  all_correct <- length(which(new_predictions == ground_truth))/length(ground_truth)
+  
+  #Check how many correctly gain - switch to accuracy
+  if (accuracy == F) {
+    #If accuracy F then just proportion correct  
+    original_gained <- which(ground_truth > 2)
+    gained_correct <- length(which(gained_probes %in% original_gained))/length(original_gained)
+    
+    #Check how many correctly lost
+    original_lost <- which(ground_truth > 2)
+    lost_correct <- length(which(lost_probes %in% original_lost))/length(original_lost)
+  } else {
+    
+    #Here can use an accuracy statistic (tp + tn/ total)
+    accurate_gains <- length(which(ground_truth > 2 & predicted_probes > cutoff))
+    accurate_notgains <- length(which(ground_truth <= 2 & predicted_probes <= cutoff))
+    gained_correct <- (accurate_gains + accurate_notgains)/length(all_chr_cnv)
+  
+    accurate_losses <- length(which(ground_truth < 2 & predicted_probes < -cutoff))
+    accurate_notlosses <- length(which(ground_truth >= 2 & predicted_probes >= -cutoff))
+    lost_correct <- (accurate_losses + accurate_notlosses)/length(all_chr_cnv)
+  }
+
+  c(all_correct, gained_correct, lost_correct)
+}
+@
+
+
+\begin{figure}[H]
+\centering
+<<Plot_predictions, fig = T,  echo = F, fig.height = 5, fig.width = 10, warning = F, message = F, results = F>>=
+#Repeat for accuracy
+accuracy_seq <- seq(0.01, 0.9, 0.01)
+
+model_accuracy <- c()
+for (i in 1:length(errors)) {
+  #Do this in a loop for all noise levels
+  
+  model_accuracy_temp <- sapply(accuracy_seq, check_model_performance, input = segmented.objects, i = i, ground_truth = all_chr_cnv, accuracy = T)
+  model_accuracy <- c(model_accuracy, as.vector(t(model_accuracy_temp)))
+}
+
+#Get standev for all samples
+sds <- c()
+for (i in 1:length(errors)) {
+  sds[i] <- sd(Ys[[i]])
+}
+
+model_accuracy <- data.frame(cutoffs = rep(accuracy_seq, 3*length(errors)), accuracy = model_accuracy, 
+                                lossgain = rep(c('Total', 'Gained', 'Lost'), each = length(accuracy_seq), 
+                                               times = length(errors)), 
+                             errors = rep(errors, each = length(accuracy_seq)*3, times = length(errors)),
+                             sds = rep(sds, each = length(accuracy_seq)*3, times = length(errors)))
+
+model_accuracy$k <- model_accuracy$cutoffs/ model_accuracy$sds
+
+ggplot(model_accuracy) + geom_line(aes(x = cutoffs, y = accuracy, col = as.factor(errors))) + facet_wrap(~lossgain) + 
+  theme_minimal() + xlab('Cutoff') + ylab('Accuracy') + 
+  theme(legend.position = 'bottom') + ylim(c(0.98, 1)) + labs(col = 'SD of noise introduced')
+@
+\caption{Accuracy of probes allocated with different cutoffs ($t_G$ and $t_L$) for gain, loss and total copy number respectively For the total accuracy $t_G = t_L$. You can see that the best accuracy is with lower cutoffs for lower levels of noise but as the noise increases the cutoffs must increase. Note that to make these plots easier to interpret they have been scaled to fit. This means that lower accuracies are not shown which is why there only a short line for noise of 0.5 SD.}
+\label{fig:plot_acc}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+<<Plateau_plot, fig = T, echo = F>>=
+par(mfrow = c(3,2))
+plot(segmented.objects[[1]][[2]], plot.type="p")
+title(sub = 'Noise of 0.05 SD')
+plot(segmented.objects[[2]][[2]], plot.type="p")
+title(sub = 'Noise of 0.1 SD')
+plot(segmented.objects[[3]][[2]], plot.type="p")
+title(sub = 'Noise of 0.2 SD')
+plot(segmented.objects[[4]][[2]], plot.type="p")
+title(sub = 'Noise of 0.25 SD')
+plot(segmented.objects[[5]][[2]], plot.type="p")
+title(sub = 'Noise of 0.5 SD')
+@
+\caption{Plateau plots for all different levels of noise, with predicted copy number (log2(R/2)) on the Y axis}
+\label{fig:plateau_plots}
+\end{figure}
+
+I also considered using a set threshold using the stardard deviation of the sample. To consider this I plotted the accuracy against the cutoffs scaled to standard deviation (fig \ref{fig:plot_acc_sd}). For this plot you can see that the optimum threshold for the cutoff appears to be around 1.5 standard deviations from the mean. However it is hard to set a threshold that is correct in all cases as you can see from these plots there is a very narrow window for the optimum accuracy. Using this method it will be difficult to validate a threshold set without a ground truth measure like the one we are using here. This shows that the better way of setting the threshold out of the two would be using the plateau plots. Another option to set cutoffs would be to use a segmented linear model.
+
+\begin{figure}[H]
+\centering
+<<Plot_acc_sd, echo = F, fig = T, fig.height = 5, fig.width = 10, warning = F, message = F, results = F>>=
+ggplot(model_accuracy) + geom_line(aes(x = k, y = accuracy, col = as.factor(errors))) + facet_wrap(~lossgain) + 
+  theme_minimal() + xlab('Cutoff (in standard deviations from sample mean)') + ylab('Accuracy') + 
+  theme(legend.position = 'bottom') + ylim(c(0.98, 1)) + labs(col = 'SD of noise')
+@
+\caption{Accuracy of predictions against different cutoffs scaled to standard deviation from mean.}
+\label{fig:plot_acc_sd}
+\end{figure}
+
+I then set the cutoffs using the plateau plots and then checked the proportion of probes correctly assigned to be either gain or loss ($TP/TP + FN$ or sensitivity, fig \ref{fig:plot_predictions}). You can see here that as the amount of noise introduced increases the sensitivity falls at optimal accuracy. This is mirrored in the accuracy plots above. The model isn't very sensitive loss of copy number probes, however the overall accuracy is similar between loss and gain. This is likely because there is a higher specificity for loss of function probes for a given accuracy, which is likely due to the way that DNAcopy handles loss of copy probes. You can also see there is a particularly big loss of performance in the proportion of probes correctly marked as gain of copy number as the amount of noise introduced increases. Again this is beacuse the signal to noise ratio worsens with more noise introduced making the sensitivity worse. It is also partially due to the fact that increasing noise will affect the gain of function log ratio more than the loss of function due to the way the log function works, as the noise is applied after the log is performed.
+
+\begin{figure}[H]
+\centering
+<<Plot_accuracy, echo = F, fig = T, fig.height = 5, fig.width = 10, warning = F, message = F, results = F>>=
+cutoffs <- rep(0.375, times = 5)
+model_performance <- sapply(1:5, check_model_performance, input = segmented.objects, cutoffs = cutoffs, ground_truth = all_chr_cnv)
+model_performance <- as.vector(t(model_performance))
+model_performance <- data.frame(noise_sd = rep(errors, 3), proportion_correct = model_performance, 
+                                lossgain = rep(c('Total', 'Gained', 'Lost'), each = 5))
+
+model_lg <- which(model_performance$lossgain %in% c('Lost', 'Gained'))
+model_performance <- model_performance[model_lg,]
+
+ggplot(model_performance) + geom_line(aes(x = noise_sd, y = proportion_correct, col = lossgain)) + facet_wrap(~lossgain) + 
+  theme_minimal() + xlab('SD of gaussiann noise introduced') + ylab('Proportion of probes correctly allocated (sensitivity)') + 
+  theme(legend.position = 'none')
+
+@
+\caption{Proportion of probes correctly allocated for gain and loss of copy number over different levels of noise introduced}
+\label{fig:plot_predictions}
+\end{figure}
+
+\section{Estimate length of CNA segments}
+
+I used the segmented means from DNAcopy and the cutoffs as above to check the length of the segments where there is a loss of copy number. Here you can see (fig \ref{fig:boxplots}) that the lengths of the segments predicted are shorter than the means of the poisson used for low levels of noise. This is likely because DNAcopy underestimates the length of the segments and any noise around the segments will not be counted causing the segments to appear shorter. However as the SD of the noise becomes larger the segments appear longer. This is accompanied by a reduction of the number of gain and loss segments which suggests that as the signal to noise ratio falls only larger segments are detected. 
+
+\begin{figure}[H]
+\centering
+<<CNA_length, fig = T, echo = F, fig.height=5, fig.width = 10>>=
+#Use cutoffs from above to get copy gain/ loss - for 0.2 we're saying 0.5
+check_gain_length <- function(i, input, cutoffs, lossgain, check_cutoffs = F) {
+  #Function to check gain and loss lengths
+  
+  #Set some parameters
+  input <- input[[i]][[2]]$output
+  
+  if (check_cutoffs == F) {
+    cutoff <- cutoffs[i]
+  } else {
+    cutoff <- cutoffs
+  }
+
+  
+  #Check length of segments
+  gain_segments <- which(input$seg.mean > cutoff)
+  gain_lengths <- input$loc.end[gain_segments] - input$loc.start[gain_segments]
+  
+  loss_segments <- which(input$seg.mean < -cutoff)
+  loss_lengths <- input$loc.end[loss_segments] - input$loc.start[loss_segments]
+  
+  #Maybe return raw values or something or could plot from inside function? - probably box plots best
+  if (lossgain %in% c('loss', 'Loss', 'L', 'l')) {
+    return(loss_lengths)
+  } else if (lossgain %in% c('gain', 'Gain', 'g', 'G')) {
+    return(gain_lengths)
+  } else {stop("Sorry I don't recognise that input - did you mean lossgain = 'loss' or 'gain'?")}
+}
+
+loss_lengths <- sapply(1:5, check_gain_length, input = segmented.objects, cutoffs = cutoffs, lossgain = 'l')
+gain_lengths <- sapply(1:5, check_gain_length, input = segmented.objects, cutoffs = cutoffs, lossgain = 'g')
+
+par(mfrow = c(1,2))
+boxplot(loss_lengths, main = 'Lengths of loss of copy segments', xaxt="none", xlab = 'Noise SD', ylab = 'CNA length', ylim = c(0, 100000))
+axis(1, at=c(1,2,3,4,5), labels=c(0.05, 0.1, 0.2, 0.25, 0.5)) 
+abline(h = 40000)
+boxplot(gain_lengths, main = 'Lengths of gain of copy segments', xaxt="none", xlab = 'Noise SD', ylab = 'CNA length', ylim = c(0, 100000))
+axis(1, at=c(1,2,3,4,5), labels=c(0.05, 0.1, 0.2, 0.25, 0.5)) 
+abline(h = 25000)
+@
+\caption{Figure showing boxplots with distributions of lengths of segments with loss of copy (left) and gain of copy (right) given different levels of noise introduced. The horizontal line marks the expected mean of the theoretical segments. There was only one segment detected for gain of copy number at 0.5 SD of noise which fell outside of the range of the plot}
+\label{fig:boxplots}
+\end{figure}
+
+Next I considered how the segment lengths changed when the cutoff was changed (fig \ref{fig:boxplots2}). Here you can see that increasing the cutoff caused the segment lengths to fall (although the median segment lengths stayed static for lower levels of noise). This suggests that a cutoff ($t_G$) above the point the length has stabilised to our predicted length should be used, as a cutoff which is too low would have artificially high segment lengths due to false positive gain of copy probes being included by the low threshold. A rationale for selecting an optimal threshold would be to set it at the level where the segment lengths have stabilised, in the largest jump in segment means in the plateau plots as above.
+
+\begin{figure}[H]
+\centering
+<<CNA_length_threshold, fig = T, echo = F, fig.height=3, fig.width = 10, warning = F, message = F, results = F>>=
+
+#Work through different thresholds at different noise - now to return segment lengths
+gain_accuracy <- data.frame(length = NULL, noise = NULL, cutoff = NULL)
+accuracy_seq <- seq(0.01, 0.2, 0.01)
+for (i in 1:length(errors)) {
+  #Do this in a loop for all noise levels
+  
+  gain_lengths_acc_temp <- sapply(accuracy_seq, check_gain_length, input = segmented.objects, i = i, lossgain = 'g', check_cutoffs = T)
+  
+  #Make it into a dataframe
+  for (j in 1:length(accuracy_seq)) {
+    if (length(gain_lengths_acc_temp[[j]]) < 1) {next} 
+        lengths_acc <- gain_lengths_acc_temp[[j]]
+        df_temp <- data.frame(length = lengths_acc, noise = errors[i], cutoff = accuracy_seq[j])
+        gain_accuracy <- rbind(gain_accuracy, df_temp)
+
+  }
+}
+
+ggplot(gain_accuracy) + geom_boxplot(aes(x = as.factor(cutoff), y = length, col = as.factor(noise))) + 
+  facet_wrap(~noise, labeller = "label_both", nrow = 1) + theme_minimal() + xlab('Cutoff used') + ylab('Segment lengths') + 
+  theme(legend.position = 'none') + ylim(c(0, 1.5e7)) + theme(axis.text.x = element_text(angle = -60, vjust = 0.5, hjust=1))
+@
+\caption{Figure showing boxplots with distributions of lengths of gain segments with different cutoffs ($t_G$) given different levels of noise introduced. You can see here that increasing the cutoff had the effect of shortening the segments}
+\label{fig:boxplots2}
+\end{figure}
+
+\section{Repeat for contamination}
+Next I introduced some normal contamination into the system. I used the identical noise for all 3 levels of contamination and the same simulated ground truth copy numbers (Z). I simulated introduction of normal cells by diluting the samples with a certain proportion of normal contamination c ($Z\times(1-c) + 2\times c$).
+
+<<Contamination, echo = F, tidy = T, fig = T, fig.height=5, fig.width=10, cache = T>>=
+contam_chr_cnv <- data.frame(twenty = all_chr_cnv*0.8 + 2*0.2, forty = all_chr_cnv*0.6 + 2*0.4, sixty = all_chr_cnv*0.4 + 2*0.6)
+
+#Do log and normal error
+log_contam_chr_cnv <- log2(contam_chr_cnv/2)
+
+#Add the errors 0.05, 0.1, 0.25, 0.2, 0.5
+Y_contam <- list()
+errors <- c(0.05, 0.1, 0.2, 0.25, 0.5) 
+for (i in 1:5) {
+  Y_contam[[i]] <- log_contam_chr_cnv + rnorm(length(log_all_cnv), mean = 0, sd = errors[i])
+}
+
+#Recreate first plot in triplicate
+fig_tb <- as_tibble(contam_chr_cnv)
+colnames(fig_tb) <- c(20,40,60)
+fig_tb  <- cbind(tibble(contamination = 1:length(all_chr_cnv)), fig_tb)
+fig_tb  <- fig_tb %>% gather(key = 'contamination', value = 'copy_number')
+fig_tb$base <- rep(1:length(all_chr_cnv), times = 3)
+fig_tb$copy_number <- as.numeric(fig_tb$copy_number)
+
+#ggplot(fig_tb) + geom_point(aes(x = base, y = copy_number, col = as.factor(copy_number), alpha = 0.2)) + 
+#  facet_wrap(~contamination) +
+#  xlab('Probe number') + ylab('Copy number') + 
+#  theme_minimal() + theme(legend.position = 'none')
+@
+
+Next I ran DNAcopy on the contaminated data. I plotted copy number calls using the DNAcopy plot function as above (fig \ref{fig:contam_plot_w}). You can see here that increasing levels of normal contamination cause fewer segmented means (red bars) to be called as change of copy number.
+
+\begin{figure}[H]
+\centering
+<<CNV_contam, fig = T, echo = F, cache = F, results=F>>=
+probe_chr <- unlist(sapply(1:22, function(x) {rep(x, times = round(3e4/ x))}))
+probe_positions <- unlist(sapply(1:22, function(x) {round(seq(1, positions$V2[x], length.out = round(3e4/ x)))}))
+
+make_cna_contam <- function(i, input, errors, contam) {
+  #Function to wrapy copy_number bits
+  label <- paste0('error_of_', errors[i])
+  input <- input[[i]][,contam]
+  
+  #Make CNA object
+  CNA.object <- CNA(cbind(input),
+                    probe_chr,probe_positions,
+                    data.type="logratio",sampleid=label)
+  
+  #Label CNA object
+  smoothed.CNA.object <- smooth.CNA(CNA.object)
+  
+  #Segment it
+  return(list(CNA.object, segment(smoothed.CNA.object, verbose=1)))
+}
+
+segmented.objects.20 <- lapply(1:5, make_cna_contam, Y_contam, errors, 'twenty')
+segmented.objects.40 <- lapply(1:5, make_cna_contam, Y_contam, errors, 'forty')
+segmented.objects.60 <- lapply(1:5, make_cna_contam, Y_contam, errors, 'sixty')
+
+par(mfrow = c(3, 1))
+plot(segmented.objects.20[[3]][[2]], plot.type="w")
+title(sub = 'Noise of 0.2 SD, 20% contamination')
+plot(segmented.objects.40[[3]][[2]], plot.type="w")
+title(sub = 'Noise of 0.2 SD, 40% contamination')
+plot(segmented.objects.60[[3]][[2]], plot.type="w")
+title(sub = 'Noise of 0.2 SD, 60% contamination')
+@
+\caption{Figure showing segmented mean copy number (log2(R/2)) on the Y axis and genomic position on X axis for different levels of normal contamination with 0.2 SD of noise}
+\label{fig:contam_plot_w}
+\end{figure}
+
+Next I repeated the test for the level of error given different levels of normal contamination. Here you can see that increasing the level of contamination increases the mean squared error consistently across all levels of noise. As DNAcopy does not correct for purity an increasing error would be expected with increasing contamination.
+
+\begin{figure}[H]
+\centering
+<<MSE_contam, fig = T, echo = F, fig.height = 4, fig.width = 10>>=
+mean_sq <- function(i, input) {
+  sum(abs(rep(input[[i]][[2]]$output$seg.mean, input[[i]][[2]]$output$num.mark) - 
+          log2(all_chr_cnv/2))^2)/length(all_chr_cnv)
+}
+
+seg.contam.mse.20 <- sapply(1:5, mean_sq, segmented.objects.20)
+seg.contam.mse.40 <- sapply(1:5, mean_sq, segmented.objects.40)
+seg.contam.mse.60 <- sapply(1:5, mean_sq, segmented.objects.60)
+
+ggplot() + geom_line(aes(x = errors, y = seg.contam.mse.20, col = 20)) + 
+  geom_point(aes(x = errors, y = seg.contam.mse.20, col = 20)) + 
+  geom_line(aes(x = errors, y = seg.contam.mse.40, col = 40)) + 
+  geom_point(aes(x = errors, y = seg.contam.mse.40, col = 40)) + 
+  geom_line(aes(x = errors, y = seg.contam.mse.60, col = 60)) + 
+  geom_point(aes(x = errors, y = seg.contam.mse.60, col = 60)) + 
+  theme_minimal() + 
+  xlab('Standard deviation of gaussian noise introduced') + 
+  ylab('Mean squared error of predicted copy number') + 
+  labs(col = 'Percent contamination')
+@
+\label{fig:mse_contam}
+\caption{Plot comparing the amount of noise introduced to the mean squared error of the predicted copy number given by DNAcopy against the original simulated copy number, coloured by the percentage normal contamination introduced}
+\end{figure}
+
+I then repeated the analysis of accuracy looking at the loss segments (fig \ref{fig:contam_acc}). You can see here that the accuracy worsens as there is increasing normal contamination. However the cutoff to have the best accuracy also falls as the contamination is increased. This makes sense as the contamination will cause any copy number changes to appear closer to 2, so the cutoffs will have to fall. It is clear from this that a calculation for purity would help to correct for these problems and improve the signal to noise ratio.
+
+\begin{figure}[H]
+\centering
+<<Plot_predictions_contam, fig = T,  echo = F, fig.height=5, fig.width = 10, message = F, warning = F>>=
+model_performance_20 <- sapply(1:5, check_model_performance, input = segmented.objects.20, cutoffs = cutoffs, ground_truth = all_chr_cnv)
+model_performance_40 <- sapply(1:5, check_model_performance, input = segmented.objects.40, cutoffs = cutoffs, ground_truth = all_chr_cnv)
+model_performance_60 <- sapply(1:5, check_model_performance, input = segmented.objects.60, cutoffs = cutoffs, ground_truth = all_chr_cnv)
+model_performance_contam <- c(as.vector(t(model_performance_20)), as.vector(t(model_performance_40)), as.vector(t(model_performance_60)))
+model_performance_contam <- data.frame(noise_sd = rep(errors, 9), proportion_correct = model_performance_contam, 
+                                lossgain = rep(c('Total', 'Gained', 'Lost'), each = 5, times = 3), contamination = rep(c(20,40,60), each = 15))
+
+accuracy_seq <- seq(0.01, 0.9, 0.01)
+model_accuracy_20 <- c()
+for (i in 1:length(errors)) {
+  #Do this in a loop for all noise levels
+  
+  model_accuracy_temp <- sapply(accuracy_seq, check_model_performance, input = segmented.objects.20, i = i, ground_truth = all_chr_cnv, accuracy = T)
+  model_accuracy_20 <- c(model_accuracy_20, as.vector(t(model_accuracy_temp)))
+}
+
+model_accuracy_40 <- c()
+for (i in 1:length(errors)) {
+  #Do this in a loop for all noise levels
+  
+  model_accuracy_temp <- sapply(accuracy_seq, check_model_performance, input = segmented.objects.40, i = i, ground_truth = all_chr_cnv, accuracy = T)
+  model_accuracy_40 <- c(model_accuracy_40, as.vector(t(model_accuracy_temp)))
+}
+
+
+model_accuracy_60 <- c()
+for (i in 1:length(errors)) {
+  #Do this in a loop for all noise levels
+  
+  model_accuracy_temp <- sapply(accuracy_seq, check_model_performance, input = segmented.objects.60, i = i, ground_truth = all_chr_cnv, accuracy = T)
+  model_accuracy_60 <- c(model_accuracy_60, as.vector(t(model_accuracy_temp)))
+}
+
+sds_contam <- data.frame(twenty = NULL, forty = NULL, sixty = NULL)
+for (i in 1:length(errors)) {
+  sds_contam <- rbind(sds_contam, apply(Y_contam[[i]], 2, sd))
+}
+
+model_accuracy_contam <- data.frame(cutoffs = rep(accuracy_seq, 9*length(errors)), accuracy = c(model_accuracy_20, model_accuracy_40, model_accuracy_60), 
+                                lossgain = rep(c('Total', 'Gained', 'Lost'), each = length(accuracy_seq), 
+                                               times = length(errors)*3), 
+                             errors = rep(errors, each = length(accuracy_seq)*3, times = length(errors)*3),
+                             sds = rep(unlist(sds_contam), each = length(accuracy_seq)*3), 
+                             contamination = rep(c(20, 40, 60), each = length(model_accuracy_20)))
+
+model_accuracy_contam$k <- model_accuracy_contam$cutoffs/ model_accuracy_contam$sds
+
+model_accuracy_contam <- model_accuracy_contam[which(model_accuracy_contam$lossgain == 'Lost'),]
+
+ggplot(model_accuracy_contam) + geom_line(aes(x = cutoffs, y = accuracy, col = as.factor(errors))) + 
+  facet_wrap(~contamination, labeller = "label_both") + 
+  theme_minimal() + xlab('Cutoff') + ylab('Accuracy') + 
+  theme(legend.position = 'bottom') + labs(col = 'SD of noise') + ylim(c(0.99, 1))
+@
+\caption{Accuracy of probes correctly allocated against cutoff ($t_L$) used, for different percentages of contamination}
+\label{fig:contam_acc}
+\end{figure}
+
+I also repeated the plots of accuracy against cutoff scaled by sample standard deviation (fig \ref{fig:contam_acc_sd}). Here you can see that scaling by sample standard deviation mostly normalises out the effect of the contamination however there remains some effect as the peaks of optimum accuracy become progressively naorrow. Again a SD cutoff of 2 could be used and would be appropriate, however it would again be impossible to validate this cutoff without a ground truth. It is also clear from the graphs that there is only a very narrow window of optimum (for example for 40\% and 60\% contamination) making this cutoff impossible to set appropriately for all samples.
+
+\begin{figure}[H]
+\centering
+<<Plot_predictions_contam_sd, fig = T,  echo = F, fig.height=5, fig.width = 10, message = F, warning = F>>=
+ggplot(model_accuracy_contam) + geom_line(aes(x = k, y = accuracy, col = as.factor(errors))) + facet_wrap(~contamination, labeller = "label_both") + 
+  theme_minimal() + xlab('Cutoff (scaled by SD)') + ylab('Accuracy') + 
+  theme(legend.position = 'bottom') + labs(col = 'SD of noise') + ylim(c(0.99, 1))
+
+@
+\caption{Accuracy of probes correctly allocated against cutoff scaled by sample standard deviation, for different percentages of contamination}
+\label{fig:contam_acc_sd}
+\end{figure}
+
+I then repeated the plots for sensitivity for gain and loss of copy number with increasing levels of normal contamination (fig \ref{fig:plot_sensitivity_contam}). You can see that increasing levels of normal contamination cause the sensitivity to fall, with 60\% normal contamination leading to the model having very poor sensitivity (sensitivity of zero for most levels of noise for both loss and gain). I also note that normal contamination (and noise) is likely to affect the gain of copy log ratio copy number more than the loss of copy log ratio due to the nature of the log function. This may explain why the sensitivity falls so rapidly with increasing noise and increasing contamination.
+
+\begin{figure}[H]
+\centering
+<<plot_sensitivity_contam, echo = F, tidy = T, fig = T, fig.height=5, fig.width = 10, message = F, warning = F>>=
+#Consider changing this to gridarrange
+model_performance_contam <- model_performance_contam[which(model_performance_contam$lossgain %in% c('Gained', 'Lost')),]
+ggplot(model_performance_contam) + geom_line(aes(x = noise_sd, y = proportion_correct, col = as.factor(contamination))) + 
+  facet_wrap(~lossgain) + 
+  theme_minimal() + xlab('SD of gaussain noise introduced') + ylab('Proportion of probes correctly allocated') + 
+  labs(col = 'Percent normal contamination') + theme(legend.position = 'bottom')
+@
+\caption{Proportion of probes correctly allocated (sensitivity) for gain and loss of copy number}
+\label{fig:plot_sensitivity_contam}
+\end{figure}
+
+I also repeated the boxplots for length (not shown). There was a similar pattern of median length falling below the poisson mean used but rising with increasing noise. However with increasing contamination and noise there were fewer copy number changes detected by DNAcopy causing very varied lengths to be found.
+
+<<CNA_length_contam, fig = T, echo = F>>=
+#Use cutoffs from above to get copy gain/ loss - for 0.2 we're saying 0.5
+loss_lengths.20 <- sapply(1:5, check_gain_length, input = segmented.objects.20, cutoffs = cutoffs, lossgain = 'l')
+gain_lengths.20 <- sapply(1:5, check_gain_length, input = segmented.objects.20, cutoffs = cutoffs, lossgain = 'g')
+loss_lengths.40 <- sapply(1:5, check_gain_length, input = segmented.objects.40, cutoffs = cutoffs, lossgain = 'l')
+gain_lengths.40 <- sapply(1:5, check_gain_length, input = segmented.objects.40, cutoffs = cutoffs, lossgain = 'g')
+loss_lengths.60 <- sapply(1:5, check_gain_length, input = segmented.objects.60, cutoffs = cutoffs, lossgain = 'l')
+gain_lengths.60 <- sapply(1:5, check_gain_length, input = segmented.objects.60, cutoffs = cutoffs, lossgain = 'g')
+
+#par(mfrow = c(3,2))
+#boxplot(loss_lengths.20, main = 'Lengths of loss of copy segments for 20% contamination', xaxt="none", xlab = 'Noise SD', ylab = 'CNA length', ylim = c(0, 100000))
+#axis(1, at=c(1,2,3,4,5), labels=c(0.05, 0.1, 0.2, 0.25, 0.5)) 
+#abline(h = 40000)
+#boxplot(gain_lengths.20, main = 'Lengths of gain of copy segments for 20% contamination', xaxt="none", xlab = 'Noise SD', ylab = 'CNA length', ylim = c(0, 100000))
+#axis(1, at=c(1,2,3,4,5), labels=c(0.05, 0.1, 0.2, 0.25, 0.5)) 
+#abline(h = 25000)
+#boxplot(loss_lengths.40, main = 'Lengths of loss of copy segments for 40% contamination', xaxt="none", xlab = 'Noise SD', ylab = 'CNA length', ylim = c(0, 100000))
+#axis(1, at=c(1,2,3,4,5), labels=c(0.05, 0.1, 0.2, 0.25, 0.5)) 
+#abline(h = 40000)
+#boxplot(gain_lengths.40, main = 'Lengths of gain of copy segments for 40% contamination', xaxt="none", xlab = 'Noise SD', ylab = 'CNA length', ylim = c(0, 100000))
+#axis(1, at=c(1,2,3,4,5), labels=c(0.05, 0.1, 0.2, 0.25, 0.5)) 
+#abline(h = 25000)
+#boxplot(loss_lengths.60, main = 'Lengths of loss of copy segments for 60% contamination', xaxt="none", xlab = 'Noise SD', ylab = 'CNA length', ylim = c(0, 100000))
+#axis(1, at=c(1,2,3,4,5), labels=c(0.05, 0.1, 0.2, 0.25, 0.5)) 
+#abline(h = 40000)
+#boxplot(gain_lengths.60, main = 'Lengths of gain of copy segments for 60% contamination', xaxt="none", xlab = 'Noise SD', ylab = 'CNA length', ylim = c(0, 100000))
+#axis(1, at=c(1,2,3,4,5), labels=c(0.05, 0.1, 0.2, 0.25, 0.5)) 
+#abline(h = 25000)
+@
+\newpage
+\section{All code used}
+<<eval = F, tidy = T>>=
+
+<<Setup>>
+  
+<<Set_initialisation>>
+  
+<<Generate_data>>
+  
+<<Make_copy_number>>
+  
+<<Plot_cn>>
+  
+<<DNA_copy>>
+  
+<<Plot_segmented_means>>
+  
+<<Compare profiles>>
+  
+<<Plot_MSE>>
+  
+<<Plateau_plot>>
+
+<<Check_predictions>>
+  
+<<Plot_predictions>>
+  
+<<Plot_accuracy>>
+  
+<<Plot_acc_sd>>
+  
+<<CNA_length>>
+  
+<<CNA_length_threshold>>
+  
+<<Contamination>>  
+
+<<CNV_contam>>
+  
+<<MSE_contam>>
+  
+<<Plot_predictions_contam>>
+  
+<<plot_sensitivity_contam>>
+  
+<<Plot_predictions_contam_sd>>
+  
+<<CNA_length_contam>>
+@
+
+\end{document}
